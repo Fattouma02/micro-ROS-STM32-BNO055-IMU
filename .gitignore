@@ -1,0 +1,27 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.list
+*.map
+*.launch.bak
+
+# CubeIDE workspace metadata (not project files)
+.metadata/
+.settings/
+.cproject.bak
+
+# micro-ROS: the static library is rebuilt by the Docker pre-build step,
+# no need to version it
+micro_ros_stm32cubemx_utils/microros_static_library_ide/libmicroros/
+
+# Editor/OS cruft
+*.swp
+.DS_Store
+
+# Stray backup/scratch files noticed in Core/Src — rename or remove before
+# committing if these are still present:
+# Core/Src/main.txt
+# Core/Src/freertos_talker_valid.txt
