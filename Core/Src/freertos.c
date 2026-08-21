@@ -48,6 +48,7 @@
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
+#include "bno055.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -60,7 +61,7 @@
 #include <rcutils/allocator.h>
 #include <std_msgs/msg/int32.h>
 #include <rmw_microros/rmw_microros.h>
-
+#include <sensor_msgs/msg/imu.h>
 #include <uxr/client/transport.h>
 /* USER CODE END Includes */
 
@@ -99,7 +100,7 @@ typedef StaticTask_t osStaticThreadDef_t;
 /* USER CODE BEGIN Variables */
 
 extern UART_HandleTypeDef huart2;
-
+extern I2C_HandleTypeDef hi2c1;
 /* ---- Transport serie fourni par dma_transport.c ---- */
 extern bool   cubemx_transport_open(struct uxrCustomTransport * transport);
 extern bool   cubemx_transport_close(struct uxrCustomTransport * transport);
@@ -120,6 +121,12 @@ static rcl_publisher_t      pong_publisher;
 static rcl_subscription_t   ping_subscriber;
 static std_msgs__msg__Int32 pong_msg;
 static std_msgs__msg__Int32 ping_msg;
+
+/* ---- Entites micro-ROS : topic imu_msg ---- */
+static rcl_publisher_t imu_publisher;
+static sensor_msgs__msg__Imu imu_msg;
+static rcl_timer_t imu_timer;
+static BNO055_Data_t bno_data;
 
 /* ---- Tache micro-ROS : pas de tag "ThreadAttributes" dans ce template,
  * donc definie ici, dans "Variables". Stack STATIQUE de 16 Ko (4096 mots),
@@ -161,8 +168,9 @@ static void ping_callback(const void * msgin);
 static void microros_wait_for_agent(void);
 static void microros_entities_init(rclc_support_t *support,
                                     rcl_node_t *node,
-                                    rclc_executor_t *executor);
-
+                                    rclc_executor_t *executor,
+                                    rcl_allocator_t *allocator);
+void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -306,25 +314,16 @@ static void microros_wait_for_agent(void)
  * etape rcl/rclc echoue (voir RCCHECK).                                     */
 static void microros_entities_init(rclc_support_t *support,
                                     rcl_node_t *node,
-                                    rclc_executor_t *executor)
+                                    rclc_executor_t *executor,
+                                    rcl_allocator_t *allocator)
 {
-    rcl_allocator_t allocator = rcl_get_default_allocator();
-
-    RCCHECK(rclc_support_init(support, 0, NULL, &allocator));
-
+    RCCHECK(rclc_support_init(support, 0, NULL, allocator));
     RCCHECK(rclc_node_init_default(node, PINGPONG_NODE_NAME, "", support));
-
-    RCCHECK(rclc_publisher_init_default(
-        &pong_publisher, node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-        TOPIC_PONG));
-
-    RCCHECK(rclc_subscription_init_default(
-        &ping_subscriber, node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-        TOPIC_PING));
-
-    RCCHECK(rclc_executor_init(executor, &support->context, 1, &allocator));
+    RCCHECK(rclc_publisher_init_default(&pong_publisher, node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), TOPIC_PONG));
+    RCCHECK(rclc_subscription_init_default(&ping_subscriber, node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), TOPIC_PING));
+    RCCHECK(rclc_executor_init(executor, &support->context, 2, allocator));
     RCCHECK(rclc_executor_add_subscription(
         executor, &ping_subscriber, &ping_msg, &ping_callback, ON_NEW_DATA));
 }
@@ -341,7 +340,7 @@ void MicroROSTask(void *argument)
     rclc_support_t  support;
     rcl_node_t      node;
     rclc_executor_t executor;
-
+    rcl_allocator_t allocator = rcl_get_default_allocator();
     /* 1. Transport serie DMA. Le 2e argument DOIT etre &huart2 :
      *    dma_transport.c lit transport->args pour retrouver l'UART.        */
     rmw_uros_set_custom_transport(
@@ -370,9 +369,36 @@ void MicroROSTask(void *argument)
     microros_wait_for_agent();
 
     /* 4-7. Support / noeud / publisher "pong" / subscriber "ping" / executor */
-    microros_entities_init(&support, &node, &executor);
+    microros_entities_init(&support, &node, &executor, &allocator);
 
     pong_msg.data = 0;
+
+
+
+
+    /* --- BNO055 hardware init --- */
+    if (!BNO055_Init(&hi2c1)) {
+        fatal_blink(BLINK_RCL_ERROR);   // reuse your existing fault signal, consistent with RCCHECK's behavior
+    }
+
+    /* --- Fields that never change between publishes, set once here --- */
+    rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
+    imu_msg.orientation_covariance[0] = -1.0;
+    imu_msg.angular_velocity_covariance[0] = -1.0;
+    imu_msg.linear_acceleration_covariance[0] = -1.0;
+
+    /* --- IMU publisher + timer, added to the SAME node/executor --- */
+    RCCHECK(rclc_publisher_init_default(
+        &imu_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "imu/data"));
+
+    RCCHECK(rclc_timer_init_default(
+        &imu_timer, &support, RCL_MS_TO_NS(50), imu_timer_callback));
+
+    RCCHECK(rclc_executor_add_timer(&executor, &imu_timer));
+
+
+
 
     /* 8-9. Boucle d'execution : spin non bloquant + cadence de tache */
     for (;;)
@@ -381,6 +407,43 @@ void MicroROSTask(void *argument)
         osDelay(MICROROS_LOOP_DELAY_MS);
     }
 }
+
+
+
+
+// Called automatically by the executor every time imu_timer fires.
+// Reads the sensor and publishes one Imu message, or does nothing on
+// a failed read (previous message values are simply not overwritten).
+void imu_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
+{
+    (void)last_call_time;      // Unused parameter - silences compiler warning
+    if (timer == NULL) return; // Defensive check; rclc can call back with NULL in some error paths
+
+    if (BNO055_ReadData(&hi2c1, &bno_data)) {
+        // Copy orientation quaternion into the message
+        imu_msg.orientation.w = bno_data.qw;
+        imu_msg.orientation.x = bno_data.qx;
+        imu_msg.orientation.y = bno_data.qy;
+        imu_msg.orientation.z = bno_data.qz;
+
+        // Copy angular velocity (rad/s) into the message
+        imu_msg.angular_velocity.x = bno_data.gx;
+        imu_msg.angular_velocity.y = bno_data.gy;
+        imu_msg.angular_velocity.z = bno_data.gz;
+
+        // Copy linear acceleration (m/s^2, gravity already removed by the chip)
+        imu_msg.linear_acceleration.x = bno_data.ax;
+        imu_msg.linear_acceleration.y = bno_data.ay;
+        imu_msg.linear_acceleration.z = bno_data.az;
+
+        // Publish immediately - rcl_publish just hands the message to the
+        // transport layer, it doesn't block waiting for a subscriber.
+        rcl_publish(&imu_publisher, &imu_msg, NULL);
+    }
+    // If BNO055_ReadData returned false, we simply skip this cycle -
+    // no message is sent, and we'll try again on the next timer tick.
+}
+
 
 /* USER CODE END Application */
 
