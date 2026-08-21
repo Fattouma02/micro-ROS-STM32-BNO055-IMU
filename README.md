@@ -1,77 +1,66 @@
-# micro-ROS STM32F401RE — ping/pong
+# micro-ROS STM32 + BNO055 IMU
 
-A minimal working integration of **micro-ROS** on an **STM32 Nucleo-F401RE**, running under **FreeRTOS (CMSIS-RTOS v2)**, communicating with a **ROS 2 Humble** micro-ROS agent over a serial (UART/DMA) transport.
+Firmware for an STM32F401RE Nucleo board, running FreeRTOS + micro-ROS, that
+reads a BNO055 IMU over I2C and publishes live orientation data as a
+`sensor_msgs/msg/Imu` message on `/imu/data`, for use by a ROS 2 host
+(see the companion visualization repo below).
 
-This is the first validated milestone of a larger project (autonomous ground vehicle: Jetson Nano for perception/planning, STM32F401RE for real-time low-level control). It exists to confirm the full toolchain — CubeMX code generation, the Docker-built `libmicroros.a`, DMA-based UART transport, and FreeRTOS task integration — before adding real sensors and motor control.
+## Part of a larger project
 
-## What it does
+This is the low-level control/sensing half of an autonomous robotized
+vehicle project (obstacle avoidance, perception, trajectory planning,
+25 km/h target speed). Two-board architecture:
 
-- A dedicated FreeRTOS task (`MicroROSTask`) initializes micro-ROS over `USART2` (the Nucleo's ST-Link Virtual COM Port) using a custom DMA transport.
-- Subscribes to `/ping` (`std_msgs/Int32`).
-- On each message received, publishes `/pong` (`std_msgs/Int32`) = `ping value + 1`, and toggles the onboard LED (`LD2`) as a visual heartbeat.
-- Runs alongside the default FreeRTOS idle task, with a static (non-heap) 16 KB stack dedicated to the micro-ROS task so it doesn't compete with micro-ROS's own internal allocations.
+- **STM32F401RE Nucleo** (this repo) — real-time sensor reading and
+  low-level control, FreeRTOS + micro-ROS
+- **Jetson Nano** — high-level perception/decision-making, ROS 2 Humble
+
+Communication: UART/DMA serial transport → micro-ROS agent → ROS 2 topics.
+
+**Companion repo:** [imu-visualization-ros2](https://github.com/Fattouma02/imu-visualization-ros2)
+— the ROS 2 Humble workspace that subscribes to `/imu/data` and visualizes
+live IMU orientation on a 3D cube in RViz2.
 
 ## Hardware
 
-- **Board:** ST Nucleo-F401RE (STM32F401RE, Cortex-M4)
-- **Transport:** USB (ST-Link Virtual COM Port) → `USART2` @ 115200 baud, 8N1
-- **Indicator:** onboard LED `LD2` (PA5) — blinks on `/ping` traffic; also used for error signaling (see below)
+- STM32F401RE Nucleo board
+- BNO055 IMU (I2C, NDOF fusion mode, quaternion output), address `0x28`
+  (write byte `0x50`), CHIP_ID `0xA0`
 
-## Software stack
+## What this firmware does
 
-- STM32CubeIDE / STM32CubeMX (HAL + FreeRTOS CMSIS-RTOS v2)
-- [`micro_ros_stm32cubemx_utils`](https://github.com/micro-ROS/micro_ros_stm32cubemx_utils) for the STM32-targeted `libmicroros.a` (built via the official micro-ROS Docker builder, ROS 2 Humble)
-- ROS 2 Humble + `micro_ros_agent` running on the host PC (Ubuntu)
+- Initializes the BNO055 over I2C (≥700ms power-on stabilization delay
+  before first read; NDOF mode via `OPR_MODE = 0x0C`)
+- Reads fused quaternion orientation, angular velocity, and linear
+  acceleration
+- Publishes `sensor_msgs/msg/Imu` on `/imu/data` at ~20 Hz via micro-ROS,
+  `frame_id = imu_link`
+- Transport: UART2 + DMA to the micro-ROS agent running on the ROS 2 host
 
-## Repository layout
+## Build
 
-```
-Core/Src/freertos.c   -- all micro-ROS + FreeRTOS application logic
-Core/Src/main.c       -- stock CubeMX-generated init (clocks, GPIO, DMA, USART2)
-Core/Src/dma_transport.c, microros_allocators.c, microros_time.c,
-Core/Src/custom_memory_manager.c
-                      -- extra_sources from micro_ros_stm32cubemx_utils
-                         (transport, FreeRTOS-based allocators, clock_gettime)
-*.ioc                 -- CubeMX project configuration
-micro_ros_stm32cubemx_utils/
-                      -- micro-ROS STM32 build utilities (git submodule / vendored)
-```
+Built with STM32CubeIDE. All custom code lives inside `USER CODE BEGIN/END`
+marker pairs so CubeMX regeneration doesn't wipe it.
 
-## Building
+**Important CubeMX setting:** "Generate peripheral initialization as a pair
+of '.c/.h' files" must remain enabled, or `MX_FREERTOS_Init()` gets removed
+from the generated output on regeneration.
 
-1. Open the project in STM32CubeIDE (workspace already contains `microrosProject.ioc`).
-2. On first build, CubeIDE runs the pre-build Docker step to (re)generate `libmicroros.a` for this target (ROS 2 Humble, STM32F401xE). Requires Docker installed and the current user in the `docker` group.
-3. Build normally (`Project → Build`).
-4. Flash via ST-Link (`Run → Debug` or `Run → Run`).
+## Status
 
-## Running
+- ✅ micro-ROS + BNO055 pipeline confirmed working end-to-end:
+  `/imu/data` publishing at ~20 Hz with valid quaternion and linear
+  acceleration (`ros2 topic hz` confirmed ~19.68 Hz stable)
+- ✅ Validated live in RViz2 via the companion visualization repo — rotating
+  the physical board rotates a TF-driven cube in real time
 
-On the PC (ROS 2 Humble sourced):
+**Full pipeline running across 4 terminals** — micro-ROS agent, tf2_broadcaster,
+robot_state_publisher, and RViz2:
 
-```bash
-# Terminal 1 — micro-ROS agent, serial transport
-ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyACM0
+![Four-terminal pipeline](docs/images/four_terminal_pipeline.png)
 
-# Terminal 2 — publish a ping
-ros2 topic pub /ping std_msgs/msg/Int32 "{data: 1}" --once
+**Live result in RViz2** — orange cube with TF axes, driven by the BNO055
+orientation quaternion. Physically rotating the board rotates the cube in
+real time:
 
-# Terminal 3 — watch for the pong
-ros2 topic echo /pong
-```
-
-Expected: each `/ping` publish produces a `/pong` message with `data = ping.data + 1`, and `LD2` blinks.
-
-## Notes on regenerating from the `.ioc`
-
-STM32CubeMX regenerates `main.c`/`freertos.c` on every `.ioc` change, merging only what's inside `USER CODE BEGIN/END` marker pairs. In this project's current CubeMX/CubeIDE version, the FreeRTOS template does **not** provide `ThreadAttributes` or a `1` tag — so the micro-ROS task definition lives in the `Variables` tag, and `fatal_blink()`/the `RCCHECK` macros/`ping_callback()` live at the top of the `Application` tag, rather than in the locations a generic micro-ROS/STM32 tutorial might suggest. Keep **`Project Manager → Code Generator → "Generate peripheral initialization as a pair of '.c/.h' files"`** checked — unchecking it removes `MX_FREERTOS_Init()` entirely and inlines task creation into `main.c`.
-
-## Status / next steps
-
-- [x] micro-ROS + FreeRTOS integration validated (this repo)
-- [ ] BNO055 IMU over I2C → publish `sensor_msgs/Imu` on `/imu/data`
-- [ ] Migrate stack to Jetson Nano
-- [ ] Integrate Livox Mid-360 LiDAR and OAK-D Lite camera
-
-## License
-
-*(add your license of choice — e.g. MIT — here)*
+![RViz2 cube visualization](docs/images/rviz2_cube_visualization.png)
